@@ -1,5 +1,5 @@
 import vinext from "vinext";
-import { defineConfig } from "vite";
+import { defineConfig, loadEnv } from "vite";
 import hostingConfig from "./.openai/hosting.json";
 import { sites } from "./build/sites-vite-plugin";
 
@@ -33,7 +33,7 @@ const localBindingConfig = {
     : [],
 };
 
-export default defineConfig(async () => {
+export default defineConfig(async ({ mode }) => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= "false";
@@ -42,6 +42,7 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import("@cloudflare/vite-plugin");
+  const runtimeEnv = loadEnv(mode, process.cwd(), "");
 
   return {
     server: {
@@ -57,7 +58,14 @@ export default defineConfig(async () => {
       cloudflare({
         viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
         inspectorPort: false,
-        config: localBindingConfig,
+        config: {
+          ...localBindingConfig,
+          vars: {
+            ADMIN_EMAIL: runtimeEnv.ADMIN_EMAIL || "",
+            OPENAI_API_KEY: runtimeEnv.OPENAI_API_KEY || "",
+            OPENAI_TRANSLATION_MODEL: runtimeEnv.OPENAI_TRANSLATION_MODEL || "gpt-4o-mini",
+          },
+        },
       }),
     ],
   };

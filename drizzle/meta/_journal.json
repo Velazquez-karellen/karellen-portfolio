@@ -29,6 +29,13 @@
       "when": 1787085992957,
       "tag": "0003_sticky_riptide",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1787088053281,
+      "tag": "0004_first_stardust",
+      "breakpoints": true
     }
   ]
 }

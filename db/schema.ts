@@ -28,7 +28,10 @@ export const contentItems = sqliteTable("content_items", {
   publishedAt: text("published_at"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
-});
+}, (table) => [
+  index("content_items_publication_idx").on(table.status, table.type, table.publishedAt),
+  index("content_items_schedule_idx").on(table.status, table.scheduledAt),
+]);
 
 export const contentTranslations = sqliteTable(
   "content_translations",
@@ -161,3 +164,41 @@ export const siteSettings = sqliteTable("site_settings", {
   value: text("value").notNull(),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
+
+export const translationJobs = sqliteTable(
+  "translation_jobs",
+  {
+    id: text("id").primaryKey(),
+    contentId: text("content_id")
+      .notNull()
+      .references(() => contentItems.id, { onDelete: "cascade" }),
+    targetLocale: text("target_locale")
+      .notNull()
+      .references(() => supportedLocales.code),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    error: text("error"),
+    requestedAt: text("requested_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    startedAt: text("started_at"),
+    completedAt: text("completed_at"),
+    updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [
+    index("translation_jobs_content_idx").on(table.contentId),
+    index("translation_jobs_status_idx").on(table.status, table.requestedAt),
+  ],
+);
+
+export const adminAuditLog = sqliteTable(
+  "admin_audit_log",
+  {
+    id: text("id").primaryKey(),
+    action: text("action").notNull(),
+    entityType: text("entity_type").notNull(),
+    entityId: text("entity_id"),
+    actorEmail: text("actor_email").notNull(),
+    details: text("details").notNull().default("{}"),
+    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [index("admin_audit_log_created_idx").on(table.createdAt)],
+);

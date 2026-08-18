@@ -1,59 +1,69 @@
-# Karellen Portfolio
+# Kare Platform backend
 
-A personal digital space where the story behind what I’m building comes together.
+Backend-first foundation for Kare Studio and Karellen's public portfolio. The root intentionally redirects to `/api/health`; visual pages will be rebuilt after the data and publishing workflows are complete.
 
-This is a bilingual portfolio and living personal site focused on software engineering, robotics, leadership, NENXORAS, projects, and long-form storytelling.
+## Architecture
 
-## Technology
+- Cloudflare Worker API
+- D1 (SQLite) for content, locales, translations, projects, settings, jobs, and audit history
+- R2 for original image files
+- Cloudflare Images binding for validation, dimensions, and responsive variants
+- OpenAI Responses API for private, server-side automatic translation
+- Drizzle migrations in `drizzle/`
 
-- TypeScript
-- React
-- Next.js / Vinext
-- Cloudflare Workers
-- Cloudflare D1 for structured content
-- Cloudflare R2 for image uploads
-- Drizzle ORM for database migrations
+There is one administrator. Public visitors have read-only access and no accounts, comments, or public write endpoints.
 
-## Open the project in IntelliJ IDEA
+## Local setup
 
-1. Install Node.js 22 or newer.
-2. Open the repository folder in IntelliJ IDEA.
-3. Open IntelliJ's terminal.
-4. Install the dependencies:
+Requirements: Node.js 22.13 or newer.
 
 ```bash
 npm install
-```
-
-5. Start the local development server:
-
-```bash
+npm run db:local:apply
 npm run dev
 ```
 
-6. Open the local address shown in the terminal.
+Create an ignored `.env.local` file:
 
-## Main folders
+```dotenv
+ADMIN_EMAIL=your-email@example.com
+OPENAI_API_KEY=your-private-key
+OPENAI_TRANSLATION_MODEL=gpt-4o-mini
+```
 
-- `app/page.tsx` — main portfolio page and bilingual content
-- `app/globals.css` — public visual system and responsive design
-- `app/mi-historia/` — long-form personal story
-- `app/studio/` — private visual content editor
-- `db/schema.ts` — content database structure
-- `drizzle/` — database migrations
-- `worker/index.ts` — server endpoints, content storage, and image uploads
+Never commit `.env.local` or expose the OpenAI key to browser code. The model only runs inside the Worker; translated text is stored in D1 and served like normal content.
 
-## Useful commands
+## API
+
+Public read endpoints:
+
+- `GET /api/health`
+- `GET /api/locales`
+- `GET /api/content?locale=es&type=photo-note&page=1&limit=20`
+- `GET /api/projects?locale=es`
+- `GET /api/technologies`
+- `GET /api/settings` (only keys beginning with `public.`)
+- `GET /media/{storage-key}?width=1200&format=webp`
+
+Private endpoints require the authenticated email header and, outside localhost, an exact match with `ADMIN_EMAIL`:
+
+- `POST|PUT|DELETE /api/locales`
+- `GET /api/content?studio=1`, `POST|PUT|DELETE /api/content`
+- `POST /api/translations`, `GET /api/translations?contentId=...`
+- `POST /api/uploads`, `GET|PUT|DELETE /api/assets`
+- `GET /api/projects?studio=1`, `PUT /api/projects`
+- `POST|PUT|DELETE /api/technologies`
+- `GET /api/settings?studio=1`, `PUT|DELETE /api/settings`
+- `GET /api/audit`
+
+`POST` and `PUT /api/content` automatically translate the original into enabled locales whose `autoTranslate` flag is active. Human-reviewed translations are preserved and never overwritten automatically.
+
+## Verification
 
 ```bash
-npm run dev
 npm run lint
-npm run db:generate
+npm test
 ```
-
-## Content studio
-
-The private `/studio` route is designed to create and update projects, posts, story chapters, travel entries, recommendations, NENXORAS updates, drafts, bilingual content, and cover images without editing the source code.
 
 ## Rights
 
