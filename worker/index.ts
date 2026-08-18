@@ -46,6 +46,12 @@ type TranslationInput = {
   translationStatus: "original" | "machine" | "reviewed";
 };
 
+type ContentMediaInput = {
+  mediaId: string;
+  role: "cover" | "gallery" | "inline";
+  sortOrder: number;
+};
+
 function canonicalLocale(value: unknown) {
   if (typeof value !== "string") return "";
   try {
@@ -64,7 +70,8 @@ function contentValues(payload: Record<string, unknown>) {
     const translation = entry as Record<string, unknown>;
     const locale = canonicalLocale(translation.locale);
     const title = typeof translation.title === "string" ? translation.title.trim() : "";
-    if (!locale || !title) return [];
+    const body = typeof translation.body === "string" ? translation.body.trim() : "";
+    if (!locale || (!title && !body)) return [];
     const requestedStatus = translation.translationStatus;
     const translationStatus = locale === sourceLocale
       ? "original"
@@ -73,9 +80,19 @@ function contentValues(payload: Record<string, unknown>) {
       locale,
       title,
       summary: typeof translation.summary === "string" ? translation.summary.trim() : "",
-      body: typeof translation.body === "string" ? translation.body.trim() : "",
+      body,
       translationStatus,
     }];
+  });
+  const rawMedia = Array.isArray(payload.media) ? payload.media : [];
+  const media = rawMedia.flatMap((entry): ContentMediaInput[] => {
+    if (!entry || typeof entry !== "object") return [];
+    const item = entry as Record<string, unknown>;
+    const mediaId = typeof item.mediaId === "string" ? item.mediaId.trim() : "";
+    if (!mediaId) return [];
+    const role = item.role === "cover" || item.role === "inline" ? item.role : "gallery";
+    const sortOrder = typeof item.sortOrder === "number" && Number.isInteger(item.sortOrder) ? item.sortOrder : 0;
+    return [{ mediaId, role, sortOrder }];
   });
 
   return {
@@ -83,7 +100,12 @@ function contentValues(payload: Record<string, unknown>) {
     status: value("status") === "published" ? "published" : "draft",
     sourceLocale,
     coverImageKey: value("coverImageKey") || null,
+    sortOrder: typeof payload.sortOrder === "number" && Number.isInteger(payload.sortOrder) ? payload.sortOrder : 0,
+    featured: payload.featured === true,
+    scheduledAt: value("scheduledAt") || null,
     translations,
+    media,
+    replaceMedia: Array.isArray(payload.media),
   };
 }
 
@@ -110,6 +132,28 @@ async function handleLocales(env: Env) {
   });
 }
 
+async function handleAssets(request: Request, env: Env) {
+  if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
+  if (!isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
+  const result = await env.DB.prepare(
+    "SELECT id, storage_key, kind, mime_type, original_filename, byte_size, width, height, created_at FROM media_assets ORDER BY created_at DESC"
+  ).all();
+  return json({
+    assets: result.results.map((row: Record<string, unknown>) => ({
+      id: row.id,
+      storageKey: row.storage_key,
+      url: `/media/${row.storage_key}`,
+      kind: row.kind,
+      mimeType: row.mime_type,
+      originalFilename: row.original_filename,
+      byteSize: row.byte_size,
+      width: row.width,
+      height: row.height,
+      createdAt: row.created_at,
+    })),
+  });
+}
+
 async function handleContent(request: Request, env: Env) {
   const url = new URL(request.url);
   const studio = url.searchParams.get("studio") === "1";
@@ -123,6 +167,25 @@ async function handleContent(request: Request, env: Env) {
       ? "SELECT t.* FROM content_translations t JOIN content_items c ON c.id = t.content_id ORDER BY t.locale"
       : "SELECT t.* FROM content_translations t JOIN content_items c ON c.id = t.content_id WHERE c.status = 'published' ORDER BY t.locale";
     const translationResult = await env.DB.prepare(translationQuery).all();
+    const mediaQuery = studio
+      ? `SELECT cm.content_id, cm.media_id, cm.role, cm.sort_order,
+          m.storage_key, m.kind, m.mime_type, m.original_filename, m.byte_size, m.width, m.height,
+          mt.locale, mt.alt_text, mt.caption
+         FROM content_media cm
+         JOIN media_assets m ON m.id = cm.media_id
+         JOIN content_items c ON c.id = cm.content_id
+         LEFT JOIN media_translations mt ON mt.media_id = m.id
+         ORDER BY cm.content_id, cm.sort_order, mt.locale`
+      : `SELECT cm.content_id, cm.media_id, cm.role, cm.sort_order,
+          m.storage_key, m.kind, m.mime_type, m.original_filename, m.byte_size, m.width, m.height,
+          mt.locale, mt.alt_text, mt.caption
+         FROM content_media cm
+         JOIN media_assets m ON m.id = cm.media_id
+         JOIN content_items c ON c.id = cm.content_id
+         LEFT JOIN media_translations mt ON mt.media_id = m.id
+         WHERE c.status = 'published'
+         ORDER BY cm.content_id, cm.sort_order, mt.locale`;
+    const mediaResult = await env.DB.prepare(mediaQuery).all();
     const translationsByContent = new Map<string, Record<string, unknown>[]>();
     for (const row of translationResult.results as Record<string, unknown>[]) {
       const contentId = String(row.content_id);
@@ -140,6 +203,35 @@ async function handleContent(request: Request, env: Env) {
       });
       translationsByContent.set(contentId, current);
     }
+    const mediaByContent = new Map<string, Map<string, Record<string, unknown>>>();
+    for (const row of mediaResult.results as Record<string, unknown>[]) {
+      const contentId = String(row.content_id);
+      const mediaId = String(row.media_id);
+      const contentAssets = mediaByContent.get(contentId) ?? new Map<string, Record<string, unknown>>();
+      const asset = contentAssets.get(mediaId) ?? {
+        id: mediaId,
+        role: row.role,
+        sortOrder: row.sort_order,
+        storageKey: row.storage_key,
+        url: `/media/${row.storage_key}`,
+        kind: row.kind,
+        mimeType: row.mime_type,
+        originalFilename: row.original_filename,
+        byteSize: row.byte_size,
+        width: row.width,
+        height: row.height,
+        translations: [],
+      };
+      if (row.locale) {
+        (asset.translations as Record<string, unknown>[]).push({
+          locale: row.locale,
+          altText: row.alt_text,
+          caption: row.caption,
+        });
+      }
+      contentAssets.set(mediaId, asset);
+      mediaByContent.set(contentId, contentAssets);
+    }
     const items = result.results.map((row: Record<string, unknown>) => ({
       id: row.id,
       type: row.type,
@@ -147,10 +239,14 @@ async function handleContent(request: Request, env: Env) {
       slug: row.slug,
       sourceLocale: row.source_locale,
       coverImageKey: row.cover_image_key,
+      sortOrder: row.sort_order,
+      featured: Boolean(row.featured),
+      scheduledAt: row.scheduled_at,
       publishedAt: row.published_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       translations: translationsByContent.get(String(row.id)) ?? [],
+      media: Array.from(mediaByContent.get(String(row.id))?.values() ?? []),
     }));
     return json({ items });
   }
@@ -164,7 +260,7 @@ async function handleContent(request: Request, env: Env) {
   const values = contentValues(payload);
   if (!values.sourceLocale) return json({ error: "A valid sourceLocale is required." }, 400);
   const original = values.translations.find((translation) => translation.locale === values.sourceLocale);
-  if (!original) return json({ error: "The original-language translation and title are required." }, 400);
+  if (!original) return json({ error: "Original-language text is required." }, 400);
   const localeRows = await env.DB.prepare("SELECT code FROM supported_locales WHERE enabled = 1").all();
   const supported = new Set(localeRows.results.map((row: Record<string, unknown>) => String(row.code)));
   const unsupported = values.translations.find((translation) => !supported.has(translation.locale));
@@ -172,11 +268,11 @@ async function handleContent(request: Request, env: Env) {
 
   if (request.method === "POST") {
     const id = crypto.randomUUID();
-    const slug = slugify(original.title, id);
+    const slug = slugify(original.title || original.body.slice(0, 80) || values.type, id);
     const publishedAt = values.status === "published" ? new Date().toISOString() : null;
     const statements = [
-      env.DB.prepare("INSERT INTO content_items (id,type,status,slug,source_locale,cover_image_key,published_at) VALUES (?,?,?,?,?,?,?)")
-        .bind(id, values.type, values.status, slug, values.sourceLocale, values.coverImageKey, publishedAt),
+      env.DB.prepare("INSERT INTO content_items (id,type,status,slug,source_locale,cover_image_key,sort_order,featured,scheduled_at,published_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
+        .bind(id, values.type, values.status, slug, values.sourceLocale, values.coverImageKey, values.sortOrder, values.featured, values.scheduledAt, publishedAt),
       ...values.translations.map((translation) => env.DB.prepare(
         "INSERT INTO content_translations (content_id,locale,title,summary,body,translation_status,source_locale,source_updated_at,translated_at) VALUES (?,?,?,?,?,?,?,?,?)"
       ).bind(
@@ -184,6 +280,9 @@ async function handleContent(request: Request, env: Env) {
         translation.translationStatus, values.sourceLocale, new Date().toISOString(),
         translation.translationStatus === "machine" ? new Date().toISOString() : null,
       )),
+      ...values.media.map((item) => env.DB.prepare(
+        "INSERT INTO content_media (content_id,media_id,role,sort_order) VALUES (?,?,?,?)"
+      ).bind(id, item.mediaId, item.role, item.sortOrder)),
     ];
     await env.DB.batch(statements);
     return json({ item: { id, slug, ...values } }, 201);
@@ -193,8 +292,8 @@ async function handleContent(request: Request, env: Env) {
     if (!id) return json({ error: "Missing content id." }, 400);
     const publishedAt = values.status === "published" ? new Date().toISOString() : null;
     const statements = [
-      env.DB.prepare("UPDATE content_items SET type=?,status=?,source_locale=?,cover_image_key=?,published_at=COALESCE(published_at,?),updated_at=CURRENT_TIMESTAMP WHERE id=?")
-        .bind(values.type, values.status, values.sourceLocale, values.coverImageKey, publishedAt, id),
+      env.DB.prepare("UPDATE content_items SET type=?,status=?,source_locale=?,cover_image_key=?,sort_order=?,featured=?,scheduled_at=?,published_at=COALESCE(published_at,?),updated_at=CURRENT_TIMESTAMP WHERE id=?")
+        .bind(values.type, values.status, values.sourceLocale, values.coverImageKey, values.sortOrder, values.featured, values.scheduledAt, publishedAt, id),
       ...values.translations.map((translation) => env.DB.prepare(
         `INSERT INTO content_translations
           (content_id,locale,title,summary,body,translation_status,source_locale,source_updated_at,translated_at)
@@ -210,6 +309,12 @@ async function handleContent(request: Request, env: Env) {
         translation.translationStatus === "machine" ? new Date().toISOString() : null,
       )),
     ];
+    if (values.replaceMedia) {
+      statements.push(env.DB.prepare("DELETE FROM content_media WHERE content_id = ?").bind(id));
+      statements.push(...values.media.map((item) => env.DB.prepare(
+        "INSERT INTO content_media (content_id,media_id,role,sort_order) VALUES (?,?,?,?)"
+      ).bind(id, item.mediaId, item.role, item.sortOrder)));
+    }
     await env.DB.batch(statements);
     return json({ item: { id, ...values } });
   }
@@ -223,9 +328,18 @@ async function handleUpload(request: Request, env: Env) {
   if (!(file instanceof File)) return json({ error: "Selecciona una imagen." }, 400);
   if (!file.type.startsWith("image/") || file.size > 10 * 1024 * 1024) return json({ error: "La imagen debe pesar menos de 10 MB." }, 400);
   const extension = file.name.split(".").pop()?.replace(/[^a-zA-Z0-9]/g, "") || "bin";
-  const key = `images/${crypto.randomUUID()}.${extension}`;
+  const id = crypto.randomUUID();
+  const key = `images/${id}.${extension}`;
   await env.BUCKET.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
-  return json({ key, url: `/media/${key}` }, 201);
+  try {
+    await env.DB.prepare(
+      "INSERT INTO media_assets (id,storage_key,kind,mime_type,original_filename,byte_size) VALUES (?,?,?,?,?,?)"
+    ).bind(id, key, "image", file.type, file.name, file.size).run();
+  } catch (error) {
+    await env.BUCKET.delete(key);
+    throw error;
+  }
+  return json({ asset: { id, key, url: `/media/${key}`, mimeType: file.type, byteSize: file.size } }, 201);
 }
 
 async function handleMedia(pathname: string, env: Env) {
@@ -247,6 +361,7 @@ const worker = {
 
     if (url.pathname === "/api/health") return handleHealth(env);
     if (url.pathname === "/api/locales" && request.method === "GET") return handleLocales(env);
+    if (url.pathname === "/api/assets") return handleAssets(request, env);
     if (url.pathname === "/api/content") return handleContent(request, env);
     if (url.pathname === "/api/uploads") return handleUpload(request, env);
     if (url.pathname.startsWith("/media/")) return handleMedia(url.pathname, env);
