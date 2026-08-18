@@ -22,6 +22,13 @@
       "when": 1787074558535,
       "tag": "0002_eager_dragon_man",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1787085992957,
+      "tag": "0003_sticky_riptide",
+      "breakpoints": true
     }
   ]
 }

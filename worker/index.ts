@@ -474,9 +474,9 @@ async function handleProjects(request: Request, env: Env) {
   if ((studio || request.method !== "GET") && !isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
   if (request.method === "GET") {
     const visibility = studio ? "" : "AND c.status = 'published'";
-    const [projectResult, technologyResult] = await Promise.all([
+    const [projectResult, technologyResult, translationResult] = await Promise.all([
       env.DB.prepare(
-        `SELECT pd.content_id, pd.project_status, pd.role, pd.repository_url, pd.live_url,
+        `SELECT pd.content_id, pd.project_status, pd.repository_url, pd.live_url,
                 pd.started_at, pd.completed_at, pd.created_at, pd.updated_at,
                 c.status AS content_status, c.slug
          FROM project_details pd
@@ -492,6 +492,13 @@ async function handleProjects(request: Request, env: Env) {
          WHERE c.type = 'project' ${visibility}
          ORDER BY t.category, t.name`
       ).all(),
+      env.DB.prepare(
+        `SELECT pt.content_id, pt.locale, pt.role, pt.updated_at
+         FROM project_translations pt
+         JOIN content_items c ON c.id = pt.content_id
+         WHERE c.type = 'project' ${visibility}
+         ORDER BY pt.locale`
+      ).all(),
     ]);
     const technologiesByProject = new Map<string, Record<string, unknown>[]>();
     for (const row of technologyResult.results as Record<string, unknown>[]) {
@@ -500,13 +507,19 @@ async function handleProjects(request: Request, env: Env) {
       technologies.push({ id: row.id, name: row.name, category: row.category });
       technologiesByProject.set(contentId, technologies);
     }
+    const translationsByProject = new Map<string, Record<string, unknown>[]>();
+    for (const row of translationResult.results as Record<string, unknown>[]) {
+      const contentId = String(row.content_id);
+      const translations = translationsByProject.get(contentId) ?? [];
+      translations.push({ locale: row.locale, role: row.role, updatedAt: row.updated_at });
+      translationsByProject.set(contentId, translations);
+    }
     return json({
       projects: projectResult.results.map((row: Record<string, unknown>) => ({
         contentId: row.content_id,
         contentStatus: row.content_status,
         slug: row.slug,
         projectStatus: row.project_status,
-        role: row.role,
         repositoryUrl: row.repository_url,
         liveUrl: row.live_url,
         startedAt: row.started_at,
@@ -514,6 +527,7 @@ async function handleProjects(request: Request, env: Env) {
         createdAt: row.created_at,
         updatedAt: row.updated_at,
         technologies: technologiesByProject.get(String(row.content_id)) ?? [],
+        translations: translationsByProject.get(String(row.content_id)) ?? [],
       })),
     });
   }
@@ -531,7 +545,6 @@ async function handleProjects(request: Request, env: Env) {
   const projectStatus = typeof payload.projectStatus === "string" && projectStatuses.has(payload.projectStatus)
     ? payload.projectStatus
     : "concept";
-  const role = typeof payload.role === "string" ? payload.role.trim().slice(0, 200) : "";
   const repositoryUrl = optionalHttpUrl(payload.repositoryUrl);
   const liveUrl = optionalHttpUrl(payload.liveUrl);
   if (repositoryUrl === "" || liveUrl === "") return json({ error: "Project URLs must use http or https." }, 400);
@@ -540,6 +553,25 @@ async function handleProjects(request: Request, env: Env) {
   const technologyIds = Array.isArray(payload.technologyIds)
     ? Array.from(new Set(payload.technologyIds.filter((id): id is string => typeof id === "string" && Boolean(id.trim())).map((id) => id.trim())))
     : [];
+  const translations = Array.isArray(payload.translations)
+    ? payload.translations.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const translation = entry as Record<string, unknown>;
+      const locale = canonicalLocale(translation.locale);
+      if (!locale) return [];
+      return [{
+        locale,
+        role: typeof translation.role === "string" ? translation.role.trim().slice(0, 200) : "",
+      }];
+    })
+    : [];
+  if (new Set(translations.map((translation) => translation.locale)).size !== translations.length) {
+    return json({ error: "Each project locale can appear only once." }, 400);
+  }
+  const localeRows = await env.DB.prepare("SELECT code FROM supported_locales WHERE enabled = 1").all();
+  const supportedLocales = new Set(localeRows.results.map((row: Record<string, unknown>) => String(row.code)));
+  const unsupportedLocale = translations.find((translation) => !supportedLocales.has(translation.locale));
+  if (unsupportedLocale) return json({ error: `Unsupported locale: ${unsupportedLocale.locale}` }, 400);
   if (technologyIds.length) {
     const placeholders = technologyIds.map(() => "?").join(",");
     const existing = await env.DB.prepare(
@@ -553,18 +585,22 @@ async function handleProjects(request: Request, env: Env) {
         (content_id,project_status,role,repository_url,live_url,started_at,completed_at)
        VALUES (?,?,?,?,?,?,?)
        ON CONFLICT(content_id) DO UPDATE SET
-        project_status=excluded.project_status,role=excluded.role,
+        project_status=excluded.project_status,
         repository_url=excluded.repository_url,live_url=excluded.live_url,
         started_at=excluded.started_at,completed_at=excluded.completed_at,
         updated_at=CURRENT_TIMESTAMP`
-    ).bind(contentId, projectStatus, role, repositoryUrl, liveUrl, startedAt, completedAt),
+    ).bind(contentId, projectStatus, "", repositoryUrl, liveUrl, startedAt, completedAt),
     env.DB.prepare("DELETE FROM project_technologies WHERE content_id = ?").bind(contentId),
+    env.DB.prepare("DELETE FROM project_translations WHERE content_id = ?").bind(contentId),
     ...technologyIds.map((technologyId) => env.DB.prepare(
       "INSERT INTO project_technologies (content_id,technology_id) VALUES (?,?)"
     ).bind(contentId, technologyId)),
+    ...translations.map((translation) => env.DB.prepare(
+      "INSERT INTO project_translations (content_id,locale,role) VALUES (?,?,?)"
+    ).bind(contentId, translation.locale, translation.role)),
   ]);
   return json({
-    project: { contentId, projectStatus, role, repositoryUrl, liveUrl, startedAt, completedAt, technologyIds },
+    project: { contentId, projectStatus, repositoryUrl, liveUrl, startedAt, completedAt, technologyIds, translations },
   });
 }
 

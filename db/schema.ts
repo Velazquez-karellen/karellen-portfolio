@@ -117,6 +117,25 @@ export const projectDetails = sqliteTable("project_details", {
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const projectTranslations = sqliteTable(
+  "project_translations",
+  {
+    contentId: text("content_id")
+      .notNull()
+      .references(() => projectDetails.contentId, { onDelete: "cascade" }),
+    locale: text("locale")
+      .notNull()
+      .references(() => supportedLocales.code),
+    role: text("role").notNull().default(""),
+    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [
+    primaryKey({ columns: [table.contentId, table.locale] }),
+    index("project_translations_locale_idx").on(table.locale),
+  ],
+);
+
 export const technologies = sqliteTable("technologies", {
   id: text("id").primaryKey(),
   name: text("name").notNull().unique(),
