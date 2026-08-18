@@ -8,6 +8,12 @@ interface Env {
   BUCKET: R2Bucket;
   ADMIN_EMAIL?: string;
   IMAGES: {
+    info(stream: ReadableStream): Promise<{
+      format: string;
+      fileSize: number;
+      width: number;
+      height: number;
+    }>;
     input(stream: ReadableStream): {
       transform(options: Record<string, unknown>): {
         output(options: { format: string; quality: number }): Promise<{ response(): Response }>;
@@ -326,20 +332,54 @@ async function handleUpload(request: Request, env: Env) {
   if (!isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
   const data = await request.formData(); const file = data.get("file");
   if (!(file instanceof File)) return json({ error: "Selecciona una imagen." }, 400);
-  if (!file.type.startsWith("image/") || file.size > 10 * 1024 * 1024) return json({ error: "La imagen debe pesar menos de 10 MB." }, 400);
-  const extension = file.name.split(".").pop()?.replace(/[^a-zA-Z0-9]/g, "") || "bin";
+  const maxImageBytes = 20 * 1024 * 1024;
+  if (file.size > maxImageBytes) return json({ error: "La imagen debe pesar 20 MB o menos." }, 400);
+
+  const mimeByFormat: Record<string, string> = {
+    avif: "image/avif",
+    gif: "image/gif",
+    jpeg: "image/jpeg",
+    png: "image/png",
+    webp: "image/webp",
+  };
+  let imageInfo: { format: string; fileSize: number; width: number; height: number };
+  try {
+    imageInfo = await env.IMAGES.info(file.stream());
+  } catch {
+    return json({ error: "El archivo no es una imagen válida o compatible." }, 400);
+  }
+  const normalizedFormat = String(imageInfo.format).toLowerCase().replace(/^image\//, "").replace("jpg", "jpeg");
+  const detectedMimeType = mimeByFormat[normalizedFormat];
+  if (!detectedMimeType || imageInfo.width < 1 || imageInfo.height < 1) {
+    return json({ error: "Usa una imagen JPEG, PNG, WebP, AVIF o GIF válida." }, 400);
+  }
+  if (imageInfo.width * imageInfo.height > 100_000_000) {
+    return json({ error: "La resolución de la imagen es demasiado grande." }, 400);
+  }
+
+  const extension = normalizedFormat === "jpeg" ? "jpg" : normalizedFormat;
   const id = crypto.randomUUID();
   const key = `images/${id}.${extension}`;
-  await env.BUCKET.put(key, file.stream(), { httpMetadata: { contentType: file.type } });
+  await env.BUCKET.put(key, file.stream(), { httpMetadata: { contentType: detectedMimeType } });
   try {
     await env.DB.prepare(
-      "INSERT INTO media_assets (id,storage_key,kind,mime_type,original_filename,byte_size) VALUES (?,?,?,?,?,?)"
-    ).bind(id, key, "image", file.type, file.name, file.size).run();
+      "INSERT INTO media_assets (id,storage_key,kind,mime_type,original_filename,byte_size,width,height) VALUES (?,?,?,?,?,?,?,?)"
+    ).bind(id, key, "image", detectedMimeType, file.name, file.size, imageInfo.width, imageInfo.height).run();
   } catch (error) {
     await env.BUCKET.delete(key);
     throw error;
   }
-  return json({ asset: { id, key, url: `/media/${key}`, mimeType: file.type, byteSize: file.size } }, 201);
+  return json({
+    asset: {
+      id,
+      key,
+      url: `/media/${key}`,
+      mimeType: detectedMimeType,
+      byteSize: file.size,
+      width: imageInfo.width,
+      height: imageInfo.height,
+    },
+  }, 201);
 }
 
 async function handleMedia(pathname: string, env: Env) {
