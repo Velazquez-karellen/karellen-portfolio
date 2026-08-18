@@ -401,6 +401,211 @@ async function handleContent(request: Request, env: Env) {
   return json({ error: "Method not allowed" }, 405);
 }
 
+async function handleTechnologies(request: Request, env: Env) {
+  if (request.method === "GET") {
+    const result = await env.DB.prepare(
+      "SELECT id, name, category, created_at FROM technologies ORDER BY category, name"
+    ).all();
+    return json({
+      technologies: result.results.map((row: Record<string, unknown>) => ({
+        id: row.id,
+        name: row.name,
+        category: row.category,
+        createdAt: row.created_at,
+      })),
+    });
+  }
+  if (!isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
+  const payload = await request.json() as Record<string, unknown>;
+  const id = typeof payload.id === "string" ? payload.id.trim() : "";
+
+  if (request.method === "POST" || request.method === "PUT") {
+    const name = typeof payload.name === "string" ? payload.name.trim() : "";
+    const category = typeof payload.category === "string" ? payload.category.trim() || "other" : "other";
+    if (!name || name.length > 100) return json({ error: "A technology name of 100 characters or fewer is required." }, 400);
+    if (category.length > 50) return json({ error: "Technology category is too long." }, 400);
+    const duplicate = await env.DB.prepare(
+      "SELECT id FROM technologies WHERE lower(name) = lower(?) AND id <> ?"
+    ).bind(name, id).first<Record<string, unknown>>();
+    if (duplicate) return json({ error: "Technology already exists." }, 409);
+    if (request.method === "POST") {
+      const technologyId = crypto.randomUUID();
+      await env.DB.prepare(
+        "INSERT INTO technologies (id,name,category) VALUES (?,?,?)"
+      ).bind(technologyId, name, category).run();
+      return json({ technology: { id: technologyId, name, category } }, 201);
+    }
+    if (!id) return json({ error: "Missing technology id." }, 400);
+    const result = await env.DB.prepare(
+      "UPDATE technologies SET name=?, category=? WHERE id=?"
+    ).bind(name, category, id).run();
+    if (!result.meta.changes) return json({ error: "Technology not found." }, 404);
+    return json({ technology: { id, name, category } });
+  }
+
+  if (request.method === "DELETE") {
+    if (!id) return json({ error: "Missing technology id." }, 400);
+    const reference = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM project_technologies WHERE technology_id = ?"
+    ).bind(id).first<Record<string, unknown>>();
+    const referenceCount = Number(reference?.count ?? 0);
+    if (referenceCount > 0) return json({ error: "Technology is still attached to projects.", references: referenceCount }, 409);
+    const result = await env.DB.prepare("DELETE FROM technologies WHERE id = ?").bind(id).run();
+    if (!result.meta.changes) return json({ error: "Technology not found." }, 404);
+    return json({ deleted: id });
+  }
+
+  return json({ error: "Method not allowed" }, 405);
+}
+
+function optionalHttpUrl(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : "";
+  } catch {
+    return "";
+  }
+}
+
+async function handleProjects(request: Request, env: Env) {
+  const url = new URL(request.url);
+  const studio = url.searchParams.get("studio") === "1";
+  if ((studio || request.method !== "GET") && !isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
+  if (request.method === "GET") {
+    const visibility = studio ? "" : "AND c.status = 'published'";
+    const [projectResult, technologyResult] = await Promise.all([
+      env.DB.prepare(
+        `SELECT pd.content_id, pd.project_status, pd.role, pd.repository_url, pd.live_url,
+                pd.started_at, pd.completed_at, pd.created_at, pd.updated_at,
+                c.status AS content_status, c.slug
+         FROM project_details pd
+         JOIN content_items c ON c.id = pd.content_id
+         WHERE c.type = 'project' ${visibility}
+         ORDER BY c.updated_at DESC`
+      ).all(),
+      env.DB.prepare(
+        `SELECT pt.content_id, t.id, t.name, t.category
+         FROM project_technologies pt
+         JOIN technologies t ON t.id = pt.technology_id
+         JOIN content_items c ON c.id = pt.content_id
+         WHERE c.type = 'project' ${visibility}
+         ORDER BY t.category, t.name`
+      ).all(),
+    ]);
+    const technologiesByProject = new Map<string, Record<string, unknown>[]>();
+    for (const row of technologyResult.results as Record<string, unknown>[]) {
+      const contentId = String(row.content_id);
+      const technologies = technologiesByProject.get(contentId) ?? [];
+      technologies.push({ id: row.id, name: row.name, category: row.category });
+      technologiesByProject.set(contentId, technologies);
+    }
+    return json({
+      projects: projectResult.results.map((row: Record<string, unknown>) => ({
+        contentId: row.content_id,
+        contentStatus: row.content_status,
+        slug: row.slug,
+        projectStatus: row.project_status,
+        role: row.role,
+        repositoryUrl: row.repository_url,
+        liveUrl: row.live_url,
+        startedAt: row.started_at,
+        completedAt: row.completed_at,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+        technologies: technologiesByProject.get(String(row.content_id)) ?? [],
+      })),
+    });
+  }
+  if (request.method !== "PUT") return json({ error: "Method not allowed" }, 405);
+
+  const payload = await request.json() as Record<string, unknown>;
+  const contentId = typeof payload.contentId === "string" ? payload.contentId.trim() : "";
+  if (!contentId) return json({ error: "Missing project content id." }, 400);
+  const content = await env.DB.prepare(
+    "SELECT id FROM content_items WHERE id = ? AND type = 'project'"
+  ).bind(contentId).first<Record<string, unknown>>();
+  if (!content) return json({ error: "Project content not found." }, 404);
+
+  const projectStatuses = new Set(["concept", "active", "paused", "completed", "archived"]);
+  const projectStatus = typeof payload.projectStatus === "string" && projectStatuses.has(payload.projectStatus)
+    ? payload.projectStatus
+    : "concept";
+  const role = typeof payload.role === "string" ? payload.role.trim().slice(0, 200) : "";
+  const repositoryUrl = optionalHttpUrl(payload.repositoryUrl);
+  const liveUrl = optionalHttpUrl(payload.liveUrl);
+  if (repositoryUrl === "" || liveUrl === "") return json({ error: "Project URLs must use http or https." }, 400);
+  const startedAt = typeof payload.startedAt === "string" ? payload.startedAt.trim() || null : null;
+  const completedAt = typeof payload.completedAt === "string" ? payload.completedAt.trim() || null : null;
+  const technologyIds = Array.isArray(payload.technologyIds)
+    ? Array.from(new Set(payload.technologyIds.filter((id): id is string => typeof id === "string" && Boolean(id.trim())).map((id) => id.trim())))
+    : [];
+  if (technologyIds.length) {
+    const placeholders = technologyIds.map(() => "?").join(",");
+    const existing = await env.DB.prepare(
+      `SELECT id FROM technologies WHERE id IN (${placeholders})`
+    ).bind(...technologyIds).all();
+    if (existing.results.length !== technologyIds.length) return json({ error: "One or more technologies do not exist." }, 400);
+  }
+  await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO project_details
+        (content_id,project_status,role,repository_url,live_url,started_at,completed_at)
+       VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(content_id) DO UPDATE SET
+        project_status=excluded.project_status,role=excluded.role,
+        repository_url=excluded.repository_url,live_url=excluded.live_url,
+        started_at=excluded.started_at,completed_at=excluded.completed_at,
+        updated_at=CURRENT_TIMESTAMP`
+    ).bind(contentId, projectStatus, role, repositoryUrl, liveUrl, startedAt, completedAt),
+    env.DB.prepare("DELETE FROM project_technologies WHERE content_id = ?").bind(contentId),
+    ...technologyIds.map((technologyId) => env.DB.prepare(
+      "INSERT INTO project_technologies (content_id,technology_id) VALUES (?,?)"
+    ).bind(contentId, technologyId)),
+  ]);
+  return json({
+    project: { contentId, projectStatus, role, repositoryUrl, liveUrl, startedAt, completedAt, technologyIds },
+  });
+}
+
+async function handleSettings(request: Request, env: Env) {
+  const url = new URL(request.url);
+  const studio = url.searchParams.get("studio") === "1";
+  if ((studio || request.method !== "GET") && !isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
+  if (request.method === "GET") {
+    const result = await env.DB.prepare(
+      studio
+        ? "SELECT key, value, updated_at FROM site_settings ORDER BY key"
+        : "SELECT key, value, updated_at FROM site_settings WHERE key LIKE 'public.%' ORDER BY key"
+    ).all();
+    return json({
+      settings: result.results.map((row: Record<string, unknown>) => ({
+        key: row.key,
+        value: row.value,
+        updatedAt: row.updated_at,
+      })),
+    });
+  }
+  const payload = await request.json() as Record<string, unknown>;
+  const key = typeof payload.key === "string" ? payload.key.trim() : "";
+  if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(key)) return json({ error: "Invalid setting key." }, 400);
+  if (key.startsWith("secret.")) return json({ error: "Secrets must use environment variables, not site settings." }, 400);
+  if (request.method === "PUT") {
+    if (typeof payload.value !== "string" || payload.value.length > 20_000) return json({ error: "Setting value must be a string of 20,000 characters or fewer." }, 400);
+    await env.DB.prepare(
+      `INSERT INTO site_settings (key,value) VALUES (?,?)
+       ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=CURRENT_TIMESTAMP`
+    ).bind(key, payload.value).run();
+    return json({ setting: { key, value: payload.value } });
+  }
+  if (request.method === "DELETE") {
+    const result = await env.DB.prepare("DELETE FROM site_settings WHERE key = ?").bind(key).run();
+    if (!result.meta.changes) return json({ error: "Setting not found." }, 404);
+    return json({ deleted: key });
+  }
+  return json({ error: "Method not allowed" }, 405);
+}
+
 async function handleUpload(request: Request, env: Env) {
   if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
   if (!isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
@@ -477,6 +682,9 @@ const worker = {
     if (url.pathname === "/api/locales" && request.method === "GET") return handleLocales(env);
     if (url.pathname === "/api/assets") return handleAssets(request, env);
     if (url.pathname === "/api/content") return handleContent(request, env);
+    if (url.pathname === "/api/projects") return handleProjects(request, env);
+    if (url.pathname === "/api/settings") return handleSettings(request, env);
+    if (url.pathname === "/api/technologies") return handleTechnologies(request, env);
     if (url.pathname === "/api/uploads") return handleUpload(request, env);
     if (url.pathname.startsWith("/media/")) return handleMedia(url.pathname, env);
 
