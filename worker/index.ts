@@ -139,25 +139,99 @@ async function handleLocales(env: Env) {
 }
 
 async function handleAssets(request: Request, env: Env) {
-  if (request.method !== "GET") return json({ error: "Method not allowed" }, 405);
   if (!isEditor(request, env)) return json({ error: "Unauthorized" }, 401);
-  const result = await env.DB.prepare(
-    "SELECT id, storage_key, kind, mime_type, original_filename, byte_size, width, height, created_at FROM media_assets ORDER BY created_at DESC"
-  ).all();
-  return json({
-    assets: result.results.map((row: Record<string, unknown>) => ({
-      id: row.id,
-      storageKey: row.storage_key,
-      url: `/media/${row.storage_key}`,
-      kind: row.kind,
-      mimeType: row.mime_type,
-      originalFilename: row.original_filename,
-      byteSize: row.byte_size,
-      width: row.width,
-      height: row.height,
-      createdAt: row.created_at,
-    })),
-  });
+  if (request.method === "GET") {
+    const [result, translationResult] = await Promise.all([
+      env.DB.prepare(
+        "SELECT id, storage_key, kind, mime_type, original_filename, byte_size, width, height, created_at FROM media_assets ORDER BY created_at DESC"
+      ).all(),
+      env.DB.prepare(
+        "SELECT media_id, locale, alt_text, caption, updated_at FROM media_translations ORDER BY locale"
+      ).all(),
+    ]);
+    const translationsByMedia = new Map<string, Record<string, unknown>[]>();
+    for (const row of translationResult.results as Record<string, unknown>[]) {
+      const mediaId = String(row.media_id);
+      const translations = translationsByMedia.get(mediaId) ?? [];
+      translations.push({
+        locale: row.locale,
+        altText: row.alt_text,
+        caption: row.caption,
+        updatedAt: row.updated_at,
+      });
+      translationsByMedia.set(mediaId, translations);
+    }
+    return json({
+      assets: result.results.map((row: Record<string, unknown>) => ({
+        id: row.id,
+        storageKey: row.storage_key,
+        url: `/media/${row.storage_key}`,
+        kind: row.kind,
+        mimeType: row.mime_type,
+        originalFilename: row.original_filename,
+        byteSize: row.byte_size,
+        width: row.width,
+        height: row.height,
+        createdAt: row.created_at,
+        translations: translationsByMedia.get(String(row.id)) ?? [],
+      })),
+    });
+  }
+
+  const payload = await request.json() as Record<string, unknown>;
+  const id = typeof payload.id === "string" ? payload.id.trim() : "";
+  if (!id) return json({ error: "Missing asset id." }, 400);
+  const asset = await env.DB.prepare(
+    "SELECT id, storage_key FROM media_assets WHERE id = ?"
+  ).bind(id).first<Record<string, unknown>>();
+  if (!asset) return json({ error: "Asset not found." }, 404);
+
+  if (request.method === "PUT") {
+    if (!Array.isArray(payload.translations)) return json({ error: "Translations are required." }, 400);
+    const translations = payload.translations.flatMap((entry) => {
+      if (!entry || typeof entry !== "object") return [];
+      const translation = entry as Record<string, unknown>;
+      const locale = canonicalLocale(translation.locale);
+      if (!locale) return [];
+      return [{
+        locale,
+        altText: typeof translation.altText === "string" ? translation.altText.trim() : "",
+        caption: typeof translation.caption === "string" ? translation.caption.trim() : "",
+      }];
+    });
+    if (new Set(translations.map((translation) => translation.locale)).size !== translations.length) {
+      return json({ error: "Each locale can appear only once." }, 400);
+    }
+    const localeRows = await env.DB.prepare("SELECT code FROM supported_locales WHERE enabled = 1").all();
+    const supported = new Set(localeRows.results.map((row: Record<string, unknown>) => String(row.code)));
+    const unsupported = translations.find((translation) => !supported.has(translation.locale));
+    if (unsupported) return json({ error: `Unsupported locale: ${unsupported.locale}` }, 400);
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM media_translations WHERE media_id = ?").bind(id),
+      ...translations.map((translation) => env.DB.prepare(
+        "INSERT INTO media_translations (media_id,locale,alt_text,caption) VALUES (?,?,?,?)"
+      ).bind(id, translation.locale, translation.altText, translation.caption)),
+    ]);
+    return json({ asset: { id, translations } });
+  }
+
+  if (request.method === "DELETE") {
+    const reference = await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM content_media WHERE media_id = ?"
+    ).bind(id).first<Record<string, unknown>>();
+    const referenceCount = Number(reference?.count ?? 0);
+    if (referenceCount > 0) {
+      return json({
+        error: "Asset is still attached to content.",
+        references: referenceCount,
+      }, 409);
+    }
+    await env.BUCKET.delete(String(asset.storage_key));
+    await env.DB.prepare("DELETE FROM media_assets WHERE id = ?").bind(id).run();
+    return json({ deleted: id });
+  }
+
+  return json({ error: "Method not allowed" }, 405);
 }
 
 async function handleContent(request: Request, env: Env) {
